@@ -1,0 +1,266 @@
+#include "telegramclient.h"
+
+
+#include "abstracttask.h"
+#include "closeapplicationtask.h"
+#include "logintask.h"
+#include "logouttask.h"
+#include "findchatidtask.h"
+
+
+TelegramClient::TelegramClient()
+{
+	init();
+}
+
+void TelegramClient::loop()
+{
+	while(true)
+	{
+		auto response = clientManager->receive(1);
+
+		if(response.object)
+		{
+			recvResponse(response);
+		}
+
+		if(currentState != Initialization)
+		{
+			if(!taskList.empty())
+			{
+				taskList.front()->execute();
+
+				if(!taskList.front()->getInProcess())
+				{
+					taskList.pop_front();
+				}
+			}
+			else
+			{
+				std::cout << "Введите задачу:\n"
+							 "quit - закрыть программу\n"
+							 "log out - разлогиниться\n"
+							 "\"find chat ID\" <имя чата> - получить ID чата по имени\n"
+							 "\"find user ID\" <имя пользователя> - получить ID пользователя по имени\n"
+							 "\"find user ID in chat\" <имя пользователя> <ID чата> - получить ID пользователя по имени в указанном, с помощью ID, чате\n"
+							 "\"delete message in chat\" <ID самого позднего сообщения> <id самого раннего сообщения> - удалить сообщения с самого позднего ID по самое раннее ID\n"
+							 "\"delete message in chat from user\" <ID самого позднего сообщения> <ID самого раннего сообщения> <ID пользователя> - удалить сообщения с самого позднего ID по самое раннее ID от указанного, с помощью ID, пользователя\n";
+
+
+				std::string newTask;
+				std::getline(std::cin, newTask);
+
+				if("log out" == newTask)
+				{
+					AbstractTask* ptrAbstractTask = new LogOutTask(this);
+
+					taskList.push_back(ptrAbstractTask);
+					std::cout << "taskList.push_back(LogOutTask)" << std::endl;
+				}
+
+
+				std::string findString = "find chat ID";
+
+				int pos = newTask.find(findString);
+
+				if(pos != -1)
+				{
+					std::string newString = newTask.substr(pos + findString.size());
+
+					std::cout << newString;
+
+					for(int i = 0; i < newString.size(); i++)
+					{
+						if(newString[i] != ' ')
+						{
+							newString = newString.erase(0, i);
+							break;
+						}
+					}
+
+					std::cout << newString;
+
+					AbstractTask* ptrAbstractTask = new FindChatIDTask(newString, this);
+
+					taskList.push_back(ptrAbstractTask);
+					std::cout << "taskList.push_back(FindChatID)" << std::endl;
+				}
+			}
+		}
+	}
+}
+
+void TelegramClient::init()
+{
+	clientManager.reset();
+
+	td::ClientManager::execute(td::td_api::make_object<td::td_api::setLogVerbosityLevel>(1));
+
+	clientManager = std::make_unique<td::ClientManager>();
+
+	clientID = clientManager->create_client_id();
+
+
+	td::td_api::object_ptr<td::td_api::Function> getOption = td::td_api::make_object<td::td_api::getOption>("version");
+
+	sendQuery(getOption);
+}
+
+std::unordered_map<std::uint64_t, AbstractTask*>::iterator TelegramClient::sendQuery(td::td_api::object_ptr<td::td_api::Function>& inputFunction, AbstractTask* ptrTask)
+{
+	auto newQueryID = nextQueryID();
+
+	clientManager->send(clientID, newQueryID, std::move(inputFunction));
+
+	if(ptrTask)
+	{
+		return queryIDHash.insert({newQueryID, ptrTask}).first;
+	}
+	else
+	{
+		return queryIDHash.end();
+	}
+}
+
+void TelegramClient::recvResponse(td::ClientManager::Response& response)
+{
+	if(!response.object)
+	{
+		return;
+	}
+
+
+	if(response.request_id == 0)
+	{
+		readResponse(response.object);
+
+		return;
+	}
+
+
+	std::unordered_map<std::uint64_t, AbstractTask*>::iterator findIterator = queryIDHash.find(response.request_id);
+
+	if(findIterator != queryIDHash.end())
+	{
+		findIterator->second->parseAndReadResponse(response);
+		queryIDHash.erase(findIterator);
+	}
+	else
+	{
+		std::cout << "Получили ответ на запрос с неизвестным ID = " << response.request_id << std::endl;
+		std::cout << to_string(response.object) << std::endl;
+	}
+}
+
+void TelegramClient::readResponse(td::td_api::object_ptr<td::td_api::Object>& response)
+{
+	switch(response->get_id())
+	{
+		case td::td_api::updateAuthorizationState::ID:
+		{
+			setAuthorizationState(response);
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+void TelegramClient::setAuthorizationState(td::td_api::object_ptr<td::td_api::Object>& response)
+{
+	td::tl_object_ptr<td::td_api::updateAuthorizationState> updateAuthorizationState = td::move_tl_object_as<td::td_api::updateAuthorizationState>(response);
+
+	if(authorizationStateID != updateAuthorizationState->authorization_state_->get_id())
+	{
+		authorizationState = std::move(updateAuthorizationState->authorization_state_);
+		authorizationStateID = authorizationState->get_id();
+
+		authorizationStateChanged();
+	}
+}
+
+void TelegramClient::authorizationStateChanged()
+{
+	switch(authorizationStateID)
+	{
+		case td::td_api::authorizationStateReady::ID:
+		{
+			setCurrentState(Authorized);
+			break;
+		}
+		case td::td_api::authorizationStateWaitTdlibParameters::ID:
+		{
+			setCurrentState(Unauthorized);
+			break;
+		}
+		case td::td_api::authorizationStateClosed::ID:
+		{
+			setCurrentState(Unauthorized);
+			init();
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+void TelegramClient::setCurrentState(State newCurrenState)
+{
+	if(currentState != newCurrenState)
+	{
+		currentState = newCurrenState;
+		currentStateChanged();
+	}
+}
+
+void TelegramClient::currentStateChanged()
+{
+	switch(currentState)
+	{
+		case Unauthorized:
+		{
+			AbstractTask* ptrAbstractTask = new LogInTask(this);
+
+			taskList.push_back(ptrAbstractTask);
+			std::cout << "taskList.push_back(LogIn)" << std::endl;
+			break;
+		}
+		case InTheAuthorizationProcess:
+		{
+			break;
+		}
+		case Authorized:
+		{
+			break;
+		}
+		case ExecutingTask:
+		{
+			break;
+		}
+		case WaitingTask:
+		{
+			break;
+		}
+		case ClosingApplication:
+		{
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+td::td_api::int53 TelegramClient::messageTDLibID_To_messageLinkID(td::td_api::int53 message_id)
+{
+	return message_id / 1048576;
+}
+
+td::td_api::int53 TelegramClient::messageLinkID_To_messageTDLibID(td::td_api::int53 message_id)
+{
+	return message_id * 1048576;
+}
+
+std::uint64_t TelegramClient::nextQueryID()
+{
+	return ++currentQueryID;
+}
